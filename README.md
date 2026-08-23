@@ -1,5 +1,7 @@
 # role-chat-frame
 
+远程：https://github.com/AnduWu668/role-chat-frame
+
 一对一角色聊天框架。产品层只维护用户和角色；会话、记忆策略、对话循环在框架里。
 
 当前仓库先落下 grill 结论，实现尚未开始。
