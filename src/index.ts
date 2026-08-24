@@ -104,6 +104,7 @@ export interface MemoryBlock {
 
 export interface MemorySystem {
   recall(context: TurnContext): Promise<readonly MemoryBlock[]>;
+  /** Must be idempotent by Turn ID because a committed Turn may be observed again. */
   observe(context: TurnContext, turn: Turn): Promise<void>;
 }
 
@@ -159,7 +160,7 @@ export interface ExecuteTurnInput {
   readonly sessionId: SessionId;
   readonly turnId: TurnId;
   readonly input: string;
-  readonly memoryBinding: MemoryBinding;
+  readonly memoryBindings: readonly MemoryBinding[];
 }
 
 export type TurnExecutionError =
@@ -180,6 +181,7 @@ export type TurnExecutionError =
 
 export interface ObservationFailure {
   readonly category: "observation-failed";
+  readonly memoryBinding: MemoryBinding;
   readonly cause: unknown;
 }
 
@@ -189,7 +191,7 @@ export type TurnExecutionResult =
       readonly status: "committed";
       readonly revision: SessionRevision;
       readonly turn: Turn;
-      readonly observationFailure?: ObservationFailure;
+      readonly observationFailures?: readonly ObservationFailure[];
     }
   | { readonly ok: false; readonly error: TurnExecutionError };
 
@@ -264,7 +266,11 @@ export async function executeTurn(
   };
   let memoryBlocks: readonly MemoryBlock[];
   try {
-    memoryBlocks = await input.memoryBinding.system.recall(context);
+    memoryBlocks = (
+      await Promise.all(
+        input.memoryBindings.map(({ system }) => system.recall(context)),
+      )
+    ).flat();
   } catch (cause) {
     return { ok: false, error: { category: "recall-failed", cause } };
   }
@@ -317,21 +323,25 @@ export async function executeTurn(
     };
   }
 
-  try {
-    await input.memoryBinding.system.observe(context, commit.turn);
-  } catch (cause) {
-    return {
-      ok: true,
-      status: "committed",
-      revision: commit.revision,
-      turn: commit.turn,
-      observationFailure: { category: "observation-failed", cause },
-    };
-  }
+  const observationFailures = (
+    await Promise.all(
+      input.memoryBindings.map(
+        async (memoryBinding): Promise<ObservationFailure[]> => {
+          try {
+            await memoryBinding.system.observe(context, commit.turn);
+            return [];
+          } catch (cause) {
+            return [{ category: "observation-failed", memoryBinding, cause }];
+          }
+        },
+      ),
+    )
+  ).flat();
   return {
     ok: true,
     status: "committed",
     revision: commit.revision,
     turn: commit.turn,
+    ...(observationFailures.length === 0 ? {} : { observationFailures }),
   };
 }

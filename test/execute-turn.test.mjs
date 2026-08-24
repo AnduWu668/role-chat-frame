@@ -99,7 +99,7 @@ test("executes and commits one complete turn before observing it", async () => {
       sessionId: "session-1",
       turnId: "turn-current",
       input: "Hello again",
-      memoryBinding,
+      memoryBindings: [memoryBinding],
     },
   );
 
@@ -251,7 +251,7 @@ test("reports typed failures without observing an uncommitted turn", async (t) =
           sessionId: "session-1",
           turnId: "turn-1",
           input: "hello",
-          memoryBinding: {
+          memoryBindings: [{
             system: {
               async recall() {
                 calls.push("recall");
@@ -262,7 +262,7 @@ test("reports typed failures without observing an uncommitted turn", async (t) =
                 calls.push("observe");
               },
             },
-          },
+          }],
         },
       );
 
@@ -317,7 +317,7 @@ test("rejects an invalid history page size before reading storage", async (t) =>
           sessionId: "session-1",
           turnId: "turn-1",
           input: "hello",
-          memoryBinding: {
+          memoryBindings: [{
             system: {
               async recall() {
                 throw new Error("must not be called");
@@ -326,7 +326,7 @@ test("rejects an invalid history page size before reading storage", async (t) =>
                 throw new Error("must not be called");
               },
             },
-          },
+          }],
         },
       );
 
@@ -387,7 +387,7 @@ test("reports a conditional commit conflict without observing", async () => {
       sessionId: "session-1",
       turnId: "turn-1",
       input: "hello",
-      memoryBinding: {
+      memoryBindings: [{
         system: {
           async recall() {
             return [];
@@ -396,7 +396,7 @@ test("reports a conditional commit conflict without observing", async () => {
             observed = true;
           },
         },
-      },
+      }],
     },
   );
 
@@ -424,13 +424,89 @@ test("reports typed storage read failures and stops the turn", async (t) => {
   }
 });
 
+test("supports a complete turn with no memory bindings", async () => {
+  const calls = [];
+  const result = await executeMinimalTurn({ calls, memoryBindings: [] });
+
+  assert.equal(result.ok, true);
+  assert.equal(calls.includes("recall"), false);
+  assert.equal(calls.includes("observe"), false);
+});
+
+test("assembles concurrent recall results in memory binding order", async () => {
+  const calls = [];
+  const contexts = [];
+  const recalls = deferred();
+  const first = deferred();
+  const second = deferred();
+  let recallsStarted = 0;
+  let assembledParts;
+  const binding = (result) => ({
+    system: {
+      recall(context) {
+        contexts.push(context);
+        recallsStarted += 1;
+        if (recallsStarted === 2) recalls.resolve();
+        return result.promise;
+      },
+      async observe() {},
+    },
+  });
+
+  const execution = executeMinimalTurn({
+    calls,
+    memoryBindings: [binding(first), binding(second)],
+    onAssemble(parts) {
+      assembledParts = parts;
+    },
+  });
+  await recalls.promise;
+  second.resolve([{ source: "second", content: "finished first" }]);
+  first.resolve([{ source: "first", content: "finished second" }]);
+
+  const result = await execution;
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(contexts, [
+    {
+      turnId: "turn-1",
+      userId: "user-1",
+      personaId: "persona-1",
+      sessionId: "session-1",
+      input: "hello",
+    },
+    {
+      turnId: "turn-1",
+      userId: "user-1",
+      personaId: "persona-1",
+      sessionId: "session-1",
+      input: "hello",
+    },
+  ]);
+  assert.deepEqual(assembledParts.memoryBlocks, [
+    { source: "first", content: "finished second" },
+    { source: "second", content: "finished first" },
+  ]);
+});
+
 test("returns the committed turn when observation fails", async () => {
   const cause = new Error("memory unavailable");
   const calls = [];
+  const memoryBinding = {
+    system: {
+      async recall() {
+        calls.push("recall");
+        return [];
+      },
+      async observe() {
+        calls.push("observe");
+        throw cause;
+      },
+    },
+  };
   const result = await executeMinimalTurn({
-    failureAt: "observe",
-    cause,
     calls,
+    memoryBindings: [memoryBinding],
   });
 
   assert.deepEqual(result, {
@@ -438,12 +514,89 @@ test("returns the committed turn when observation fails", async () => {
     status: "committed",
     revision: "revision-2",
     turn: { id: "turn-1", input: "hello", output: "hi" },
-    observationFailure: { category: "observation-failed", cause },
+    observationFailures: [
+      { category: "observation-failed", memoryBinding, cause },
+    ],
   });
   assert.deepEqual(calls.slice(-2), ["commit", "observe"]);
 });
 
-async function executeMinimalTurn({ failureAt, cause, calls }) {
+test("waits for every observation and reports each binding failure", async () => {
+  const calls = [];
+  const firstCause = new Error("first memory unavailable");
+  const thirdCause = new Error("third memory unavailable");
+  const observationsStarted = deferred();
+  const delayedObservation = deferred();
+  let started = 0;
+  const binding = (name, observe) => ({
+    system: {
+      async recall() {
+        return [];
+      },
+      async observe() {
+        calls.push(name);
+        started += 1;
+        if (started === 3) observationsStarted.resolve();
+        return observe();
+      },
+    },
+  });
+  const firstBinding = binding("observe-first", async () => {
+    throw firstCause;
+  });
+  const secondBinding = binding(
+    "observe-second",
+    () => delayedObservation.promise,
+  );
+  const thirdBinding = binding("observe-third", async () => {
+    throw thirdCause;
+  });
+
+  let settled = false;
+  const execution = executeMinimalTurn({
+    calls,
+    memoryBindings: [firstBinding, secondBinding, thirdBinding],
+  });
+  execution.then(() => {
+    settled = true;
+  });
+  await observationsStarted.promise;
+  await new Promise((resolve) => setImmediate(resolve));
+  const settledBeforeAllObservations = settled;
+  delayedObservation.resolve();
+
+  const result = await execution;
+
+  assert.equal(settledBeforeAllObservations, false);
+  assert.deepEqual(calls.slice(-4), [
+    "commit",
+    "observe-first",
+    "observe-second",
+    "observe-third",
+  ]);
+  assert.equal(result.ok, true);
+  assert.equal(result.turn.id, "turn-1");
+  assert.deepEqual(result.observationFailures, [
+    {
+      category: "observation-failed",
+      memoryBinding: firstBinding,
+      cause: firstCause,
+    },
+    {
+      category: "observation-failed",
+      memoryBinding: thirdBinding,
+      cause: thirdCause,
+    },
+  ]);
+});
+
+async function executeMinimalTurn({
+  failureAt,
+  cause,
+  calls,
+  memoryBindings,
+  onAssemble,
+}) {
   return executeTurn(
     {
       sessionStore: {
@@ -486,8 +639,9 @@ async function executeMinimalTurn({ failureAt, cause, calls }) {
         },
       },
       contextAssembler: {
-        async assemble() {
+        async assemble(parts) {
           calls.push("assemble");
+          onAssemble?.(parts);
           return { messages: [] };
         },
       },
@@ -503,7 +657,7 @@ async function executeMinimalTurn({ failureAt, cause, calls }) {
       sessionId: "session-1",
       turnId: "turn-1",
       input: "hello",
-      memoryBinding: {
+      memoryBindings: memoryBindings ?? [{
         system: {
           async recall() {
             calls.push("recall");
@@ -514,7 +668,15 @@ async function executeMinimalTurn({ failureAt, cause, calls }) {
             if (failureAt === "observe") throw cause;
           },
         },
-      },
+      }],
     },
   );
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
 }
