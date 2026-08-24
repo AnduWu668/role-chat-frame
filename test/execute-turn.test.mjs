@@ -35,6 +35,10 @@ test("executes and commits one complete turn before observing it", async () => {
         nextCursor: "older-page",
       };
     },
+    async findTurn(input) {
+      calls.push(["find-turn", input]);
+      return null;
+    },
     async commit(input) {
       calls.push(["commit", input]);
       return {
@@ -141,6 +145,7 @@ test("executes and commits one complete turn before observing it", async () => {
   assert.deepEqual(observedTurn, authoritativeTurn);
   assert.deepEqual(calls, [
     ["read-session", { sessionId: "session-1", limit: 20 }],
+    ["find-turn", { sessionId: "session-1", turnId: "turn-current" }],
     ["read-persona", "persona-1"],
     ["read-character-definition", "character-1"],
     [
@@ -203,6 +208,10 @@ test("reports typed failures without observing an uncommitted turn", async (t) =
             revision: "revision-1",
             turns: [],
           };
+        },
+        async findTurn() {
+          calls.push("find-turn");
+          return null;
         },
         async commit() {
           calls.push("commit");
@@ -358,6 +367,9 @@ test("rejects an invalid history page size before reading storage", async (t) =>
               read = true;
               throw new Error("must not be called");
             },
+            async findTurn() {
+              throw new Error("must not be called");
+            },
             async commit() {
               throw new Error("must not be called");
             },
@@ -428,6 +440,9 @@ test("reports a conditional commit conflict without observing", async () => {
             turns: [],
           };
         },
+        async findTurn() {
+          return null;
+        },
         async commit() {
           return { status: "conflict", revision: "revision-2" };
         },
@@ -468,7 +483,39 @@ test("reports a conditional commit conflict without observing", async () => {
   assert.equal(observed, false);
 });
 
-test("returns an authoritative duplicate turn and observes it again", async () => {
+test("recovers an existing turn before generation and observes it again", async () => {
+  const calls = [];
+  const authoritativeTurn = {
+    id: "turn-1",
+    input: "hello",
+    output: "saved response",
+  };
+  const result = await executeMinimalTurn({ calls, existingTurn: authoritativeTurn });
+
+  assert.deepEqual(result, {
+    ok: true,
+    status: "duplicate",
+    revision: "revision-1",
+    turn: authoritativeTurn,
+  });
+  assert.deepEqual(calls, ["read-session", "find-turn", "observe"]);
+});
+
+test("rejects a reused Turn ID with different input before generation", async () => {
+  const calls = [];
+  const result = await executeMinimalTurn({
+    calls,
+    existingTurn: { id: "turn-1", input: "different", output: "saved response" },
+  });
+
+  assert.deepEqual(result, {
+    ok: false,
+    error: { category: "turn-id-conflict", revision: "revision-1" },
+  });
+  assert.deepEqual(calls, ["read-session", "find-turn"]);
+});
+
+test("uses the authoritative duplicate from a racing commit", async () => {
   const calls = [];
   const authoritativeTurn = {
     id: "turn-1",
@@ -525,11 +572,16 @@ test("reports a Turn ID conflict without observing", async () => {
 });
 
 test("reports typed storage read failures and stops the turn", async (t) => {
-  for (const store of ["session", "persona", "character-definition"]) {
-    await t.test(store, async () => {
-      const cause = new Error(`${store} unavailable`);
+  for (const [failureAt, store] of [
+    ["session", "session"],
+    ["find-turn", "session"],
+    ["persona", "persona"],
+    ["character-definition", "character-definition"],
+  ]) {
+    await t.test(failureAt, async () => {
+      const cause = new Error(`${failureAt} unavailable`);
       const calls = [];
-      const result = await executeMinimalTurn({ failureAt: store, cause, calls });
+      const result = await executeMinimalTurn({ failureAt, cause, calls });
 
       assert.deepEqual(result, {
         ok: false,
@@ -723,6 +775,9 @@ test("an application gate serializes each session through observation", async ()
           turns: [],
         };
       },
+      async findTurn() {
+        return null;
+      },
       async commit({ sessionId, turnId, turn }) {
         return {
           status: "committed",
@@ -814,6 +869,9 @@ test("conditional commit discards a concurrently generated stale turn", async ()
           turns: [],
         };
       },
+      async findTurn() {
+        return null;
+      },
       async commit({ expectedRevision, turnId, turn }) {
         if (expectedRevision !== revision) {
           return { status: "conflict", revision };
@@ -897,6 +955,7 @@ async function executeMinimalTurn({
   sessionTurns,
   onGenerate,
   commitResult,
+  existingTurn,
 }) {
   return executeTurn(
     {
@@ -911,6 +970,11 @@ async function executeMinimalTurn({
             revision: "revision-1",
             turns: sessionTurns ?? [],
           };
+        },
+        async findTurn() {
+          calls.push("find-turn");
+          if (failureAt === "find-turn") throw cause;
+          return existingTurn ?? null;
         },
         async commit() {
           calls.push("commit");

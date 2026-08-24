@@ -70,9 +70,13 @@ export interface SessionStore {
     readonly before?: SessionCursor;
     readonly limit: number;
   }): Promise<SessionPage | null>;
+  findTurn(input: {
+    readonly sessionId: SessionId;
+    readonly turnId: TurnId;
+  }): Promise<Turn | null>;
   /**
    * Check Session ID + Turn ID before expectedRevision. Return the stored Turn
-   * as duplicate when its content matches, or turn-id-conflict when it differs.
+   * as duplicate when its input matches; do not compare generated output.
    */
   commit(input: {
     readonly sessionId: SessionId;
@@ -310,6 +314,39 @@ export async function executeTurn(
     return { ok: false, error: { category: "session-not-found" } };
   }
 
+  const context: TurnContext = {
+    turnId: input.turnId,
+    userId: page.userId,
+    personaId: page.personaId,
+    sessionId: page.sessionId,
+    input: input.input,
+  };
+  let existingTurn: Turn | null;
+  try {
+    existingTurn = await dependencies.sessionStore.findTurn({
+      sessionId: input.sessionId,
+      turnId: input.turnId,
+    });
+  } catch (cause) {
+    return {
+      ok: false,
+      error: { category: "store-read-failed", store: "session", cause },
+    };
+  }
+  if (existingTurn !== null) {
+    if (existingTurn.input !== input.input) {
+      return {
+        ok: false,
+        error: { category: "turn-id-conflict", revision: page.revision },
+      };
+    }
+    return completeTurn(input.memoryBindings, context, {
+      status: "duplicate",
+      revision: page.revision,
+      turn: existingTurn,
+    });
+  }
+
   let persona: Persona | null;
   try {
     persona = await dependencies.personaStore.get(page.personaId);
@@ -345,13 +382,6 @@ export async function executeTurn(
     };
   }
 
-  const context: TurnContext = {
-    turnId: input.turnId,
-    userId: page.userId,
-    personaId: page.personaId,
-    sessionId: page.sessionId,
-    input: input.input,
-  };
   let memoryBlocks: readonly MemoryBlock[];
   try {
     memoryBlocks = (
@@ -423,9 +453,20 @@ export async function executeTurn(
     };
   }
 
+  return completeTurn(input.memoryBindings, context, commit);
+}
+
+async function completeTurn(
+  memoryBindings: readonly MemoryBinding[],
+  context: TurnContext,
+  commit: Extract<
+    CommitResult,
+    { readonly status: "committed" | "duplicate" }
+  >,
+): Promise<TurnExecutionResult> {
   const observationFailures = (
     await Promise.all(
-      input.memoryBindings.map(
+      memoryBindings.map(
         async (memoryBinding): Promise<ObservationFailure[]> => {
           try {
             await memoryBinding.system.observe(context, commit.turn);
