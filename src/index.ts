@@ -139,6 +139,71 @@ export interface ContextAssembler {
   assemble(parts: ContextParts): Promise<ModelInput>;
 }
 
+export interface DefaultContextAssemblerOptions {
+  readonly maxTokens: number;
+  readonly countTokens: (input: ModelInput) => number;
+}
+
+export class ContextBudgetExceededError extends Error {
+  readonly name = "ContextBudgetExceededError";
+
+  constructor(
+    readonly maxTokens: number,
+    readonly requiredTokens: number,
+  ) {
+    super(
+      `Fixed context requires ${requiredTokens} tokens, exceeding the ${maxTokens}-token budget`,
+    );
+  }
+}
+
+export class DefaultContextAssembler implements ContextAssembler {
+  constructor(private readonly options: DefaultContextAssemblerOptions) {
+    if (!Number.isSafeInteger(options.maxTokens) || options.maxTokens < 0) {
+      throw new RangeError("maxTokens must be a non-negative safe integer");
+    }
+  }
+
+  async assemble(parts: ContextParts): Promise<ModelInput> {
+    let requiredTokens = 0;
+    for (let omitted = 0; omitted <= parts.sessionMessages.length; omitted++) {
+      const input: ModelInput = {
+        messages: [
+          ...parts.characterDefinitionFragments.map(({ content }) => ({
+            role: "system" as const,
+            content,
+          })),
+          ...parts.personaOverrideFragments.map(({ content }) => ({
+            role: "system" as const,
+            content,
+          })),
+          ...parts.sessionMessages
+            .slice(omitted)
+            .map(({ role, content }) => ({ role, content })),
+          ...parts.memoryBlocks.map(({ content }) => ({
+            role: "system" as const,
+            content,
+          })),
+          { role: "user", content: parts.input },
+        ],
+      };
+      requiredTokens = this.options.countTokens(input);
+      if (!Number.isSafeInteger(requiredTokens) || requiredTokens < 0) {
+        throw new RangeError(
+          "countTokens must return a non-negative safe integer",
+        );
+      }
+      if (requiredTokens <= this.options.maxTokens) {
+        return input;
+      }
+    }
+    throw new ContextBudgetExceededError(
+      this.options.maxTokens,
+      requiredTokens,
+    );
+  }
+}
+
 export interface ModelOutput {
   readonly content: string;
 }
@@ -174,6 +239,10 @@ export type TurnExecutionError =
       readonly cause: unknown;
     }
   | { readonly category: "recall-failed"; readonly cause: unknown }
+  | {
+      readonly category: "context-budget-exceeded";
+      readonly cause: ContextBudgetExceededError;
+    }
   | { readonly category: "context-assembly-failed"; readonly cause: unknown }
   | { readonly category: "model-invocation-failed"; readonly cause: unknown }
   | { readonly category: "commit-failed"; readonly cause: unknown }
@@ -291,6 +360,12 @@ export async function executeTurn(
       input: input.input,
     });
   } catch (cause) {
+    if (cause instanceof ContextBudgetExceededError) {
+      return {
+        ok: false,
+        error: { category: "context-budget-exceeded", cause },
+      };
+    }
     return {
       ok: false,
       error: { category: "context-assembly-failed", cause },

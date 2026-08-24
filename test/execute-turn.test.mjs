@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { executeTurn } from "../dist/index.js";
+import {
+  ContextBudgetExceededError,
+  DefaultContextAssembler,
+  executeTurn,
+} from "../dist/index.js";
 
 test("executes and commits one complete turn before observing it", async () => {
   const calls = [];
@@ -277,6 +281,63 @@ test("reports typed failures without observing an uncommitted turn", async (t) =
       }
     });
   }
+});
+
+test("stops the turn with a typed context budget failure", async () => {
+  const calls = [];
+  const result = await executeMinimalTurn({
+    calls,
+    contextAssembler: new DefaultContextAssembler({
+      maxTokens: 4,
+      countTokens: ({ messages }) =>
+        messages.reduce((tokens, { content }) => tokens + content.length, 0),
+    }),
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error.category, "context-budget-exceeded");
+  assert.equal(result.error.cause instanceof ContextBudgetExceededError, true);
+  assert.equal(calls.includes("model"), false);
+  assert.equal(calls.includes("commit"), false);
+  assert.equal(calls.includes("observe"), false);
+});
+
+test("sends the default assembler's ordered trimmed context to the model", async () => {
+  const calls = [];
+  let modelInput;
+  const result = await executeMinimalTurn({
+    calls,
+    characterDefinitionFragments: [{ name: "character", content: "cc" }],
+    personaOverrideFragments: [{ name: "persona", content: "pp" }],
+    sessionTurns: [{ id: "old-turn", input: "1111", output: "222" }],
+    memoryBindings: [{
+      system: {
+        async recall() {
+          return [{ source: "memory", content: "mm" }];
+        },
+        async observe() {},
+      },
+    }],
+    contextAssembler: new DefaultContextAssembler({
+      maxTokens: 14,
+      countTokens: ({ messages }) =>
+        messages.reduce((tokens, { content }) => tokens + content.length, 0),
+    }),
+    onGenerate(input) {
+      modelInput = input;
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(modelInput, {
+    messages: [
+      { role: "system", content: "cc" },
+      { role: "system", content: "pp" },
+      { role: "assistant", content: "222" },
+      { role: "system", content: "mm" },
+      { role: "user", content: "hello" },
+    ],
+  });
 });
 
 test("rejects an invalid history page size before reading storage", async (t) => {
@@ -596,6 +657,11 @@ async function executeMinimalTurn({
   calls,
   memoryBindings,
   onAssemble,
+  contextAssembler,
+  characterDefinitionFragments,
+  personaOverrideFragments,
+  sessionTurns,
+  onGenerate,
 }) {
   return executeTurn(
     {
@@ -608,7 +674,7 @@ async function executeMinimalTurn({
             userId: "user-1",
             personaId: "persona-1",
             revision: "revision-1",
-            turns: [],
+            turns: sessionTurns ?? [],
           };
         },
         async commit() {
@@ -627,7 +693,7 @@ async function executeMinimalTurn({
           return {
             id,
             characterDefinitionId: "character-1",
-            overrideFragments: [],
+            overrideFragments: personaOverrideFragments ?? [],
           };
         },
       },
@@ -635,10 +701,10 @@ async function executeMinimalTurn({
         async get(id) {
           calls.push("read-character-definition");
           if (failureAt === "character-definition") throw cause;
-          return { id, fragments: [] };
+          return { id, fragments: characterDefinitionFragments ?? [] };
         },
       },
-      contextAssembler: {
+      contextAssembler: contextAssembler ?? {
         async assemble(parts) {
           calls.push("assemble");
           onAssemble?.(parts);
@@ -646,8 +712,9 @@ async function executeMinimalTurn({
         },
       },
       model: {
-        async generate() {
+        async generate(input) {
           calls.push("model");
+          onGenerate?.(input);
           return { content: "hi" };
         },
       },
