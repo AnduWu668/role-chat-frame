@@ -468,6 +468,62 @@ test("reports a conditional commit conflict without observing", async () => {
   assert.equal(observed, false);
 });
 
+test("returns an authoritative duplicate turn and observes it again", async () => {
+  const calls = [];
+  const authoritativeTurn = {
+    id: "turn-1",
+    input: "hello",
+    output: "saved response",
+  };
+  let observedTurn;
+  const result = await executeMinimalTurn({
+    calls,
+    commitResult: {
+      status: "duplicate",
+      revision: "revision-7",
+      turn: authoritativeTurn,
+    },
+    memoryBindings: [{
+      system: {
+        async recall() {
+          calls.push("recall");
+          return [];
+        },
+        async observe(_context, turn) {
+          calls.push("observe");
+          observedTurn = turn;
+        },
+      },
+    }],
+  });
+
+  assert.deepEqual(result, {
+    ok: true,
+    status: "duplicate",
+    revision: "revision-7",
+    turn: authoritativeTurn,
+  });
+  assert.equal(observedTurn, authoritativeTurn);
+  assert.deepEqual(calls.slice(-2), ["commit", "observe"]);
+});
+
+test("reports a Turn ID conflict without observing", async () => {
+  const calls = [];
+  const result = await executeMinimalTurn({
+    calls,
+    commitResult: {
+      status: "turn-id-conflict",
+      revision: "revision-7",
+    },
+  });
+
+  assert.deepEqual(result, {
+    ok: false,
+    error: { category: "turn-id-conflict", revision: "revision-7" },
+  });
+  assert.equal(calls.includes("observe"), false);
+});
+
 test("reports typed storage read failures and stops the turn", async (t) => {
   for (const store of ["session", "persona", "character-definition"]) {
     await t.test(store, async () => {
@@ -651,6 +707,184 @@ test("waits for every observation and reports each binding failure", async () =>
   ]);
 });
 
+test("an application gate serializes each session through observation", async () => {
+  const events = [];
+  const observationStarted = deferred();
+  const finishObservation = deferred();
+  const dependencies = {
+    sessionStore: {
+      async read({ sessionId }) {
+        events.push(`read:${sessionId}`);
+        return {
+          sessionId,
+          userId: `user:${sessionId}`,
+          personaId: `persona:${sessionId}`,
+          revision: `revision:${sessionId}`,
+          turns: [],
+        };
+      },
+      async commit({ sessionId, turnId, turn }) {
+        return {
+          status: "committed",
+          revision: `committed:${sessionId}`,
+          turn: { id: turnId, ...turn },
+        };
+      },
+    },
+    personaStore: {
+      async get(id) {
+        return { id, characterDefinitionId: "character-1", overrideFragments: [] };
+      },
+    },
+    characterDefinitionStore: {
+      async get(id) {
+        return { id, fragments: [] };
+      },
+    },
+    contextAssembler: {
+      async assemble() {
+        return { messages: [] };
+      },
+    },
+    model: {
+      async generate() {
+        return { content: "reply" };
+      },
+    },
+    historyPageSize: 10,
+  };
+  const gate = createSessionGate();
+  const run = (input) => gate(input.sessionId, () => executeTurn(dependencies, input));
+
+  const first = run({
+    sessionId: "session-1",
+    turnId: "turn-1",
+    input: "first",
+    memoryBindings: [{
+      system: {
+        async recall() {
+          return [];
+        },
+        async observe() {
+          events.push("observe:start");
+          observationStarted.resolve();
+          await finishObservation.promise;
+          events.push("observe:end");
+        },
+      },
+    }],
+  });
+  await observationStarted.promise;
+  const second = run({
+    sessionId: "session-1",
+    turnId: "turn-2",
+    input: "second",
+    memoryBindings: [],
+  });
+  const independent = run({
+    sessionId: "session-2",
+    turnId: "turn-3",
+    input: "independent",
+    memoryBindings: [],
+  });
+
+  assert.equal((await independent).ok, true);
+  assert.equal(events.includes("read:session-2"), true);
+  assert.equal(events.filter((event) => event === "read:session-1").length, 1);
+  finishObservation.resolve();
+  assert.equal((await first).ok, true);
+  assert.equal((await second).ok, true);
+  assert.equal(events.indexOf("observe:end") < events.lastIndexOf("read:session-1"), true);
+});
+
+test("conditional commit discards a concurrently generated stale turn", async () => {
+  let revision = "revision-1";
+  let generated = 0;
+  const bothGenerated = deferred();
+  const committedTurns = [];
+  const observedTurns = [];
+  const dependencies = {
+    sessionStore: {
+      async read() {
+        return {
+          sessionId: "session-1",
+          userId: "user-1",
+          personaId: "persona-1",
+          revision,
+          turns: [],
+        };
+      },
+      async commit({ expectedRevision, turnId, turn }) {
+        if (expectedRevision !== revision) {
+          return { status: "conflict", revision };
+        }
+        revision = "revision-2";
+        const committed = { id: turnId, ...turn };
+        committedTurns.push(committed);
+        return { status: "committed", revision, turn: committed };
+      },
+    },
+    personaStore: {
+      async get(id) {
+        return { id, characterDefinitionId: "character-1", overrideFragments: [] };
+      },
+    },
+    characterDefinitionStore: {
+      async get(id) {
+        return { id, fragments: [] };
+      },
+    },
+    contextAssembler: {
+      async assemble({ input }) {
+        return { messages: [{ role: "user", content: input }] };
+      },
+    },
+    model: {
+      async generate({ messages }) {
+        generated += 1;
+        if (generated === 2) bothGenerated.resolve();
+        await bothGenerated.promise;
+        return { content: `reply:${messages[0].content}` };
+      },
+    },
+    historyPageSize: 10,
+  };
+  const memoryBindings = [{
+    system: {
+      async recall() {
+        return [];
+      },
+      async observe(_context, turn) {
+        observedTurns.push(turn);
+      },
+    },
+  }];
+
+  const results = await Promise.all([
+    executeTurn(dependencies, {
+      sessionId: "session-1",
+      turnId: "turn-1",
+      input: "first",
+      memoryBindings,
+    }),
+    executeTurn(dependencies, {
+      sessionId: "session-1",
+      turnId: "turn-2",
+      input: "second",
+      memoryBindings,
+    }),
+  ]);
+
+  assert.equal(generated, 2);
+  assert.equal(results.filter(({ ok }) => ok).length, 1);
+  assert.deepEqual(
+    results.filter(({ ok }) => !ok).map(({ error }) => error),
+    [{ category: "commit-conflict", revision: "revision-2" }],
+  );
+  assert.deepEqual(observedTurns, committedTurns);
+  assert.equal(committedTurns.length, 1);
+});
+
 async function executeMinimalTurn({
   failureAt,
   cause,
@@ -662,6 +896,7 @@ async function executeMinimalTurn({
   personaOverrideFragments,
   sessionTurns,
   onGenerate,
+  commitResult,
 }) {
   return executeTurn(
     {
@@ -679,7 +914,7 @@ async function executeMinimalTurn({
         },
         async commit() {
           calls.push("commit");
-          return {
+          return commitResult ?? {
             status: "committed",
             revision: "revision-2",
             turn: { id: "turn-1", input: "hello", output: "hi" },
@@ -746,4 +981,14 @@ function deferred() {
     resolve = settle;
   });
   return { promise, resolve };
+}
+
+function createSessionGate() {
+  const tails = new Map();
+  return async (sessionId, run) => {
+    const previous = tails.get(sessionId) ?? Promise.resolve();
+    const current = previous.then(run);
+    tails.set(sessionId, current.catch(() => {}));
+    return current;
+  };
 }

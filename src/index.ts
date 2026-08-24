@@ -70,6 +70,10 @@ export interface SessionStore {
     readonly before?: SessionCursor;
     readonly limit: number;
   }): Promise<SessionPage | null>;
+  /**
+   * Check Session ID + Turn ID before expectedRevision. Return the stored Turn
+   * as duplicate when its content matches, or turn-id-conflict when it differs.
+   */
   commit(input: {
     readonly sessionId: SessionId;
     readonly expectedRevision: SessionRevision;
@@ -85,7 +89,16 @@ export type CommitResult =
       readonly turn: Turn;
     }
   | {
+      readonly status: "duplicate";
+      readonly revision: SessionRevision;
+      readonly turn: Turn;
+    }
+  | {
       readonly status: "conflict";
+      readonly revision: SessionRevision;
+    }
+  | {
+      readonly status: "turn-id-conflict";
       readonly revision: SessionRevision;
     };
 
@@ -246,7 +259,8 @@ export type TurnExecutionError =
   | { readonly category: "context-assembly-failed"; readonly cause: unknown }
   | { readonly category: "model-invocation-failed"; readonly cause: unknown }
   | { readonly category: "commit-failed"; readonly cause: unknown }
-  | { readonly category: "commit-conflict"; readonly revision: SessionRevision };
+  | { readonly category: "commit-conflict"; readonly revision: SessionRevision }
+  | { readonly category: "turn-id-conflict"; readonly revision: SessionRevision };
 
 export interface ObservationFailure {
   readonly category: "observation-failed";
@@ -257,13 +271,18 @@ export interface ObservationFailure {
 export type TurnExecutionResult =
   | {
       readonly ok: true;
-      readonly status: "committed";
+      readonly status: "committed" | "duplicate";
       readonly revision: SessionRevision;
       readonly turn: Turn;
       readonly observationFailures?: readonly ObservationFailure[];
     }
   | { readonly ok: false; readonly error: TurnExecutionError };
 
+/**
+ * Applications must serialize calls by Session ID until this promise settles,
+ * including every post-commit observation attempt. Different Sessions may run
+ * concurrently; this function does not lock or retry model generation.
+ */
 export async function executeTurn(
   dependencies: TurnExecutorDependencies,
   input: ExecuteTurnInput,
@@ -397,6 +416,12 @@ export async function executeTurn(
       error: { category: "commit-conflict", revision: commit.revision },
     };
   }
+  if (commit.status === "turn-id-conflict") {
+    return {
+      ok: false,
+      error: { category: "turn-id-conflict", revision: commit.revision },
+    };
+  }
 
   const observationFailures = (
     await Promise.all(
@@ -414,7 +439,7 @@ export async function executeTurn(
   ).flat();
   return {
     ok: true,
-    status: "committed",
+    status: commit.status,
     revision: commit.revision,
     turn: commit.turn,
     ...(observationFailures.length === 0 ? {} : { observationFailures }),
