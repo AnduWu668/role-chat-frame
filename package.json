@@ -1,0 +1,23 @@
+{
+  "name": "role-chat-frame",
+  "version": "0.1.0",
+  "description": "Composable core for one-to-one character chat turns",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/index.d.ts",
+    "dist/index.js"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node --test"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  }
+}
